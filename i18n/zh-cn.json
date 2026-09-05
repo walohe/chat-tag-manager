@@ -1,0 +1,9 @@
+{
+  "ctm_title": "聊天标签管理",
+  "ctm_description": "在“管理聊天文件”中给聊天打标签、筛选和批量管理。",
+  "ctm_show_tags": "在聊天卡片上显示标签",
+  "ctm_current_scope_tags": "当前角色卡/群聊的标签",
+  "ctm_tags_refresh": "刷新",
+  "ctm_clear_scope": "清空当前角色卡的标签",
+  "ctm_clear_all": "清空全部数据"
+}

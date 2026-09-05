@@ -1,0 +1,9 @@
+{
+  "ctm_title": "Chat Tag Manager",
+  "ctm_description": "Tag, filter and batch-manage chats in Manage Chat Files.",
+  "ctm_show_tags": "Show tags on chat cards",
+  "ctm_current_scope_tags": "Tags for the current character/group",
+  "ctm_tags_refresh": "Refresh",
+  "ctm_clear_scope": "Clear tags of the current character",
+  "ctm_clear_all": "Clear all data"
+}
