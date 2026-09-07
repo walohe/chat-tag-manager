@@ -1,7 +1,6 @@
 import {
     TAG_KINDS,
     addTags,
-    collectTags,
     deleteTagKind,
     ensureTagKind,
     getScopeKey,
@@ -45,6 +44,12 @@ const strings = {
         cleared: '已清空。',
         select: '选择模式',
         cancelSelect: '退出选择',
+        filterToggle: '筛选标签',
+        hideFilter: '收起筛选',
+        filterPanelTitle: '按标签筛选',
+        tagPanelTitle: '标签管理',
+        batchSection: '输入标签',
+        inputTag: '输入标签',
         filterPlaceholder: '筛选标签…',
         clearFilter: '清除筛选',
         filterOptions: '已添加的标签',
@@ -92,6 +97,12 @@ const strings = {
         cleared: 'Cleared.',
         select: 'Select mode',
         cancelSelect: 'Exit select',
+        filterToggle: 'Filter chats',
+        hideFilter: 'Hide filter',
+        filterPanelTitle: 'Filter by tag',
+        tagPanelTitle: 'Tag manager',
+        batchSection: 'Type a tag',
+        inputTag: 'Type a tag',
         filterPlaceholder: 'Filter by tag…',
         clearFilter: 'Clear filter',
         filterOptions: 'Added tags',
@@ -133,8 +144,11 @@ let lifecycleEpoch = 0;
 let dataResetting = false;
 let selectMode = false;
 let filterQuery = '';
+let filterPanelOpen = false;
+let activePanelSection = 'filter';
 let filterOutsideBound = false;
 let autoScanRunning = false;
+let selectModeGuardInstalled = false;
 const filterGroupCollapsed = { model: true, preset: true, manual: false };
 const settingsGroupCollapsed = { model: true, preset: true, manual: false };
 
@@ -413,6 +427,14 @@ function setFilter(query) {
     filterQuery = String(query ?? '').trim();
     const filterInput = document.querySelector('#ctm_filter');
     if (filterInput) filterInput.value = filterQuery;
+    if (filterQuery) {
+        // 从标签胶囊或下拉选项发起筛选时，自动展开筛选栏，让用户能看到当前筛选条件并能快速清除。
+        if (!filterPanelOpen) {
+            toggleFilterPanel(true, 'filter');
+        } else {
+            setPanelSection('filter');
+        }
+    }
     applyFilter();
     updateTagDatalist();
 }
@@ -427,12 +449,77 @@ function applyFilter() {
     });
 }
 
+function updateSelectModeUI() {
+    const selectToggle = document.querySelector('#ctm_select_toggle');
+    if (selectToggle) {
+        selectToggle.classList.toggle('ctm-active', selectMode);
+        selectToggle.title = selectMode ? s().cancelSelect : s().select;
+        const icon = selectToggle.querySelector('i');
+        if (icon) icon.className = selectMode ? 'fa-solid fa-check' : 'fa-solid fa-check-double';
+    }
+    document.querySelector('#select_chat_div')?.classList.toggle('ctm-select-mode', selectMode);
+}
+
+function handleSelectModeCardClick(event) {
+    if (!selectMode) return;
+    const container = document.querySelector('#select_chat_div');
+    if (!container) {
+        // 管理聊天文件弹窗已经关闭，但选择模式还开着：自动退出，避免全局监听残留。
+        selectMode = false;
+        selection.clear();
+        uninstallSelectModeGuard();
+        updateBatchBar();
+        return;
+    }
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const wrapper = target.closest('.select_chat_block_wrapper');
+    if (!wrapper || !container.contains(wrapper)) return;
+
+    // 勾选框交给原生 change 事件处理；标签胶囊仍用于按标签筛选，不拦截。
+    if (target.closest('.ctm-select') || target.closest('.ctm-tag')) return;
+    // 保留卡片上原生按钮/链接/输入框的交互，例如单聊删除、重命名等。
+    if (target.closest('button, a, input, select, textarea')) return;
+
+    // 在捕获阶段拦住原生“打开聊天”的点击，改为勾选/取消勾选。
+    event.preventDefault();
+    event.stopPropagation();
+    const block = wrapper.querySelector('.select_chat_block');
+    const fileName = normalizeFileName(
+        wrapper.dataset.ctmFile || block?.getAttribute('file_name'),
+        { physical: true },
+    );
+    if (fileName) {
+        const checked = !selection.has(fileName);
+        toggleSelect(fileName, checked);
+        const checkbox = wrapper.querySelector('.ctm-select');
+        if (checkbox) checkbox.checked = checked;
+    }
+}
+
+function installSelectModeGuard() {
+    if (selectModeGuardInstalled) return;
+    selectModeGuardInstalled = true;
+    document.addEventListener('click', handleSelectModeCardClick, true);
+}
+
+function uninstallSelectModeGuard() {
+    if (!selectModeGuardInstalled) return;
+    selectModeGuardInstalled = false;
+    document.removeEventListener('click', handleSelectModeCardClick, true);
+}
+
 function toggleSelectMode() {
     selectMode = !selectMode;
-    if (!selectMode) selection.clear();
+    if (!selectMode) {
+        selection.clear();
+        uninstallSelectModeGuard();
+    } else {
+        installSelectModeGuard();
+    }
     renderVisibleCards();
     updateBatchBar();
-    document.querySelector('#select_chat_div')?.classList.toggle('ctm-select-mode', selectMode);
+    updateSelectModeUI();
 }
 
 function toggleSelect(fileName, checked) {
@@ -483,9 +570,15 @@ async function applyBatch(action) {
     }
 }
 
+let tagHostObserver = null;
+
 function ensureToolbar() {
     const header = document.querySelector('#select_chat_popup [name="selectChatPopupHeader"]');
-    if (!header || header.querySelector('#ctm_toolbar')) return;
+    if (!header || document.querySelector('#ctm_toolbar')) return;
+    // 内嵌栏挂在聊天列表上方，重建工具条前先清掉可能残留的旧面板。
+    document.querySelector('#ctm_panel')?.remove();
+    filterPanelOpen = false;
+    filterQuery = '';
     const toolbar = document.createElement('div');
     toolbar.id = 'ctm_toolbar';
     toolbar.className = 'ctm-toolbar ctm-injected';
@@ -501,19 +594,155 @@ function ensureToolbar() {
         toggleSelectMode();
     });
 
+    const panelToggle = document.createElement('button');
+    panelToggle.id = 'ctm_panel_toggle';
+    panelToggle.type = 'button';
+    panelToggle.className = 'menu_button menu_button_icon ctm-panel-toggle';
+    panelToggle.innerHTML = '<i class="fa-solid fa-filter"></i>';
+    panelToggle.title = s().filterToggle;
+    panelToggle.append(document.createTextNode(s().filterToggle));
+    panelToggle.setAttribute('aria-expanded', 'false');
+    panelToggle.addEventListener('click', event => {
+        event.stopPropagation();
+        toggleFilterPanel();
+    });
+
+    const main = document.createElement('div');
+    main.className = 'ctm-toolbar-main';
+    main.append(selectToggle, panelToggle);
+
+    const panel = document.createElement('div');
+    panel.id = 'ctm_panel';
+    panel.className = 'ctm-panel ctm-viewport-panel ctm-injected';
+    panel.hidden = true;
+
+    const floatHead = document.createElement('div');
+    floatHead.className = 'ctm-float-head';
+    const floatTitle = document.createElement('span');
+    floatTitle.className = 'ctm-float-title';
+    floatTitle.textContent = s().tagPanelTitle;
+    const closePanelBtn = document.createElement('button');
+    closePanelBtn.id = 'ctm_filter_panel_close';
+    closePanelBtn.type = 'button';
+    closePanelBtn.className = 'menu_button menu_button_icon';
+    closePanelBtn.innerHTML = '<i class="fa-solid fa-xmark"></i>';
+    closePanelBtn.title = s().hideFilter;
+    closePanelBtn.addEventListener('click', event => {
+        event.stopPropagation();
+        toggleFilterPanel(false);
+    });
+    floatHead.append(closePanelBtn, floatTitle);
+    panel.append(floatHead);
+
+    const modeBar = document.createElement('div');
+    modeBar.className = 'ctm-panel-mode';
+
+    const filterModeBtn = document.createElement('button');
+    filterModeBtn.id = 'ctm_mode_filter';
+    filterModeBtn.type = 'button';
+    filterModeBtn.className = 'ctm-panel-mode-btn';
+    filterModeBtn.innerHTML = '<i class="fa-solid fa-filter"></i>';
+    filterModeBtn.append(document.createTextNode(s().filterToggle));
+    filterModeBtn.append(document.createElement('i'));
+    filterModeBtn.lastChild.className = 'fa-solid fa-chevron-down ctm-mode-chevron';
+    filterModeBtn.addEventListener('click', event => {
+        event.stopPropagation();
+        setPanelSection('filter');
+    });
+
+    const batchModeBtn = document.createElement('button');
+    batchModeBtn.id = 'ctm_mode_batch';
+    batchModeBtn.type = 'button';
+    batchModeBtn.className = 'ctm-panel-mode-btn';
+    batchModeBtn.innerHTML = '<i class="fa-solid fa-pen"></i>';
+    batchModeBtn.append(document.createTextNode(s().batchSection));
+    batchModeBtn.append(document.createElement('i'));
+    batchModeBtn.lastChild.className = 'fa-solid fa-chevron-down ctm-mode-chevron';
+    batchModeBtn.addEventListener('click', event => {
+        event.stopPropagation();
+        setPanelSection('batch');
+    });
+
+    modeBar.append(filterModeBtn, batchModeBtn);
+
+    const filterView = document.createElement('div');
+    filterView.id = 'ctm_filter_view';
+    filterView.className = 'ctm-panel-view';
+
+    const batchView = document.createElement('div');
+    batchView.id = 'ctm_batch_view';
+    batchView.className = 'ctm-panel-view';
+    batchView.hidden = true;
+
+    const panelBatchCount = document.createElement('span');
+    panelBatchCount.id = 'ctm_panel_batch_count';
+    panelBatchCount.className = 'ctm-batch-count';
+
+    const panelBatchTag = document.createElement('input');
+    panelBatchTag.id = 'ctm_batch_tag';
+    panelBatchTag.type = 'text';
+    panelBatchTag.className = 'text_pole';
+    panelBatchTag.placeholder = s().batchTagPlaceholder;
+    panelBatchTag.setAttribute('autocomplete', 'off');
+    panelBatchTag.addEventListener('input', () => {
+        updateTagDatalist();
+    });
+    panelBatchTag.addEventListener('keydown', event => {
+        if (event.key === 'Enter' && !event.isComposing) {
+            event.preventDefault();
+            applyBatch('add');
+        }
+    });
+
+    const panelAddBtn = document.createElement('button');
+    panelAddBtn.id = 'ctm_batch_panel_add';
+    panelAddBtn.type = 'button';
+    panelAddBtn.className = 'menu_button';
+    panelAddBtn.textContent = s().addTag;
+    panelAddBtn.addEventListener('click', event => {
+        event.stopPropagation();
+        applyBatch('add');
+    });
+
+    const panelRemoveBtn = document.createElement('button');
+    panelRemoveBtn.id = 'ctm_batch_panel_remove';
+    panelRemoveBtn.type = 'button';
+    panelRemoveBtn.className = 'menu_button';
+    panelRemoveBtn.textContent = s().removeTag;
+    panelRemoveBtn.addEventListener('click', event => {
+        event.stopPropagation();
+        applyBatch('remove');
+    });
+
+    const panelBatchActions = document.createElement('div');
+    panelBatchActions.className = 'ctm-batch-panel-actions';
+    panelBatchActions.append(panelAddBtn, panelRemoveBtn);
+
+    const panelBatchListTitle = document.createElement('div');
+    panelBatchListTitle.className = 'ctm-panel-list-title';
+    panelBatchListTitle.textContent = s().filterOptions;
+
+    const panelBatchOptions = document.createElement('div');
+    panelBatchOptions.id = 'ctm_batch_tag_options';
+    panelBatchOptions.className = 'ctm-filter-options ctm-inline-options';
+
+    const panelBatchOptionsList = document.createElement('div');
+    panelBatchOptionsList.id = 'ctm_batch_tag_options_list';
+    panelBatchOptionsList.className = 'ctm-filter-options-list';
+    panelBatchOptions.append(panelBatchOptionsList);
+
+    batchView.append(panelBatchCount, panelBatchTag, panelBatchActions, panelBatchListTitle, panelBatchOptions);
+
     const filter = document.createElement('input');
     filter.id = 'ctm_filter';
     filter.type = 'text';
     filter.className = 'text_pole';
     filter.placeholder = s().filterPlaceholder;
-    filter.setAttribute('list', 'ctm_tag_datalist');
     filter.addEventListener('input', () => {
         filterQuery = filter.value.trim();
         applyFilter();
+        updateTagDatalist();
     });
-
-    const datalist = document.createElement('datalist');
-    datalist.id = 'ctm_tag_datalist';
 
     const filterControls = document.createElement('div');
     filterControls.id = 'ctm_filter_controls';
@@ -556,7 +785,21 @@ function ensureToolbar() {
         updateTagDatalist();
     });
 
-    toolbar.append(selectToggle, filterControls, datalist, clearFilter);
+    filterView.append(filterControls, clearFilter);
+    panel.append(modeBar, filterView, batchView);
+    toolbar.append(main);
+    document.body.append(panel);
+    tagHostObserver?.disconnect();
+    tagHostObserver = new MutationObserver(() => {
+        const host = document.querySelector('#select_chat_popup');
+        if (!host?.getClientRects().length) toggleFilterPanel(false);
+    });
+    for (const host of [header.closest('#select_chat_popup'), header.closest('#shadow_select_chat_popup')]) {
+        if (host) tagHostObserver.observe(host, { attributes: true, attributeFilter: ['style', 'class', 'hidden'] });
+    }
+    window.addEventListener('resize', positionTagPanel);
+    window.visualViewport?.addEventListener('resize', positionTagPanel);
+    window.visualViewport?.addEventListener('scroll', positionTagPanel);
 
     const batch = document.createElement('div');
     batch.id = 'ctm_batch';
@@ -567,65 +810,6 @@ function ensureToolbar() {
     count.id = 'ctm_batch_count';
     count.className = 'ctm-batch-count';
 
-    const batchTag = document.createElement('input');
-    batchTag.id = 'ctm_batch_tag';
-    batchTag.type = 'text';
-    batchTag.className = 'text_pole';
-    batchTag.placeholder = s().batchTagPlaceholder;
-    batchTag.setAttribute('list', 'ctm_tag_datalist');
-    batchTag.addEventListener('keydown', event => {
-        if (event.key === 'Enter') {
-            event.preventDefault();
-            applyBatch('add');
-        }
-    });
-
-    const batchTagControls = document.createElement('div');
-    batchTagControls.id = 'ctm_batch_tag_controls';
-    batchTagControls.className = 'ctm-batch-tag-controls';
-
-    const batchTagOptionsBtn = document.createElement('button');
-    batchTagOptionsBtn.id = 'ctm_batch_tag_options_btn';
-    batchTagOptionsBtn.type = 'button';
-    batchTagOptionsBtn.className = 'menu_button menu_button_icon';
-    batchTagOptionsBtn.innerHTML = '<i class="fa-solid fa-chevron-down"></i>';
-    batchTagOptionsBtn.title = s().tagPicker;
-    batchTagOptionsBtn.setAttribute('aria-expanded', 'false');
-    batchTagOptionsBtn.addEventListener('click', event => {
-        event.stopPropagation();
-        toggleBatchTagOptions();
-    });
-
-    const batchTagOptions = document.createElement('div');
-    batchTagOptions.id = 'ctm_batch_tag_options';
-    batchTagOptions.className = 'ctm-filter-options';
-    batchTagOptions.hidden = true;
-
-    const batchTagOptionsList = document.createElement('div');
-    batchTagOptionsList.id = 'ctm_batch_tag_options_list';
-    batchTagOptionsList.className = 'ctm-filter-options-list';
-    batchTagOptions.append(batchTagOptionsList);
-
-    batchTagControls.append(batchTag, batchTagOptionsBtn, batchTagOptions);
-
-    const addBtn = document.createElement('button');
-    addBtn.type = 'button';
-    addBtn.className = 'menu_button';
-    addBtn.textContent = s().addTag;
-    addBtn.addEventListener('click', event => {
-        event.stopPropagation();
-        applyBatch('add');
-    });
-
-    const removeBtn = document.createElement('button');
-    removeBtn.type = 'button';
-    removeBtn.className = 'menu_button';
-    removeBtn.textContent = s().removeTag;
-    removeBtn.addEventListener('click', event => {
-        event.stopPropagation();
-        applyBatch('remove');
-    });
-
     const clearBtn = document.createElement('button');
     clearBtn.type = 'button';
     clearBtn.className = 'menu_button';
@@ -635,28 +819,98 @@ function ensureToolbar() {
         clearSelection();
     });
 
-    batch.append(count, batchTagControls, addBtn, removeBtn, clearBtn);
+    const openTagInputBtn = document.createElement('button');
+    openTagInputBtn.id = 'ctm_open_tag_input';
+    openTagInputBtn.type = 'button';
+    openTagInputBtn.className = 'menu_button';
+    openTagInputBtn.innerHTML = '<i class="fa-solid fa-pen"></i>';
+    openTagInputBtn.append(document.createTextNode(s().inputTag));
+    openTagInputBtn.addEventListener('click', event => {
+        event.stopPropagation();
+        toggleFilterPanel(true, 'batch');
+    });
+
+    batch.append(count, openTagInputBtn, clearBtn);
     toolbar.append(batch);
 
-    const search = header.querySelector('#select_chat_search');
-    header.insertBefore(toolbar, search);
+    header.after(toolbar);
+    updateFilterPanel();
+    updateSelectModeUI();
     if (!filterOutsideBound) {
         filterOutsideBound = true;
-        document.addEventListener('mousedown', event => {
-            const target = event.target;
-            if (target instanceof Element && target.closest('#ctm_filter_options, #ctm_filter_options_btn, #ctm_batch_tag_options, #ctm_batch_tag_options_btn')) return;
-            toggleFilterOptions(false);
-            toggleBatchTagOptions(false);
-        });
         document.addEventListener('keydown', event => {
             if (event.key === 'Escape') {
-                toggleFilterOptions(false);
                 toggleBatchTagOptions(false);
+                toggleFilterPanel(false);
             }
         });
     }
     updateBatchBar();
     updateTagDatalist();
+}
+
+function updateFilterPanel() {
+    const panel = document.querySelector('#ctm_panel');
+    const button = document.querySelector('#ctm_panel_toggle');
+    if (!panel || !button) return;
+    panel.hidden = !filterPanelOpen;
+    const options = document.querySelector('#ctm_filter_options');
+    if (options) options.hidden = !filterPanelOpen || activePanelSection !== 'filter';
+    button.classList.toggle('ctm-active', filterPanelOpen || Boolean(filterQuery));
+    button.title = filterPanelOpen ? s().hideFilter : s().filterToggle;
+    button.setAttribute('aria-expanded', String(filterPanelOpen));
+    if (filterPanelOpen) {
+        updatePanelSectionUI();
+        positionTagPanel();
+    }
+}
+
+function updatePanelSectionUI() {
+    const filterModeBtn = document.querySelector('#ctm_mode_filter');
+    const batchModeBtn = document.querySelector('#ctm_mode_batch');
+    const filterView = document.querySelector('#ctm_filter_view');
+    const batchView = document.querySelector('#ctm_batch_view');
+    if (!filterModeBtn || !batchModeBtn || !filterView || !batchView) return;
+    const isFilter = activePanelSection !== 'batch';
+    filterModeBtn.classList.toggle('ctm-active', isFilter);
+    filterModeBtn.setAttribute('aria-expanded', String(isFilter));
+    batchModeBtn.classList.toggle('ctm-active', !isFilter);
+    batchModeBtn.setAttribute('aria-expanded', String(!isFilter));
+    filterView.hidden = !isFilter;
+    batchView.hidden = isFilter;
+    const filterOptions = document.querySelector('#ctm_filter_options');
+    if (filterOptions) filterOptions.hidden = !isFilter;
+}
+
+function setPanelSection(section) {
+    activePanelSection = section === 'batch' ? 'batch' : 'filter';
+    updateTagDatalist();
+    updateFilterPanel();
+}
+
+function positionTagPanel() {
+    const panel = document.querySelector('#ctm_panel');
+    if (!panel || panel.hidden) return;
+    const viewport = window.visualViewport;
+    // Use the visible screen directly, never the changing chat-dialog bounds.
+    const availableWidth = viewport?.width ?? document.documentElement.clientWidth;
+    const availableHeight = viewport?.height ?? window.innerHeight;
+    const width = Math.max(0, Math.min(560, availableWidth - 16));
+    const height = Math.max(0, Math.min(720, availableHeight - 16));
+    panel.style.width = width + 'px';
+    panel.style.height = height + 'px';
+    panel.style.left = ((viewport?.offsetLeft ?? 0) + (availableWidth - width) / 2) + 'px';
+    panel.style.top = ((viewport?.offsetTop ?? 0) + Math.max(8, (availableHeight - height) / 2)) + 'px';
+}
+
+function toggleFilterPanel(force, section) {
+    if (typeof section === 'string') {
+        activePanelSection = section === 'batch' ? 'batch' : 'filter';
+    }
+    const shouldOpen = typeof force === 'boolean' ? force : !filterPanelOpen;
+    filterPanelOpen = shouldOpen;
+    if (filterPanelOpen) updateTagDatalist();
+    updateFilterPanel();
 }
 
 function updateBatchBar() {
@@ -665,6 +919,8 @@ function updateBatchBar() {
     batch.hidden = !selection.size;
     const count = document.querySelector('#ctm_batch_count');
     if (count) count.textContent = s().selected(selection.size);
+    const panelCount = document.querySelector('#ctm_panel_batch_count');
+    if (panelCount) panelCount.textContent = selection.size ? s().selected(selection.size) : s().noSelection;
 }
 
 function updateTagDatalist() {
@@ -672,38 +928,33 @@ function updateTagDatalist() {
     const records = recordStore.loadedScopes.has(scope.key)
         ? recordStore.scope(scope.key)
         : {};
-    const tags = collectTags(records);
-    const datalist = document.querySelector('#ctm_tag_datalist');
-    if (datalist) {
-        datalist.replaceChildren(...tags.map(tag => {
-            const option = document.createElement('option');
-            option.value = tag;
-            return option;
-        }));
-    }
     const groups = collectGroupedTags(records);
     renderFilterOptions(groups);
     renderBatchTagOptions(groups);
 }
 
-function toggleFilterOptions(force) {
-    const panel = document.querySelector('#ctm_filter_options');
-    const btn = document.querySelector('#ctm_filter_options_btn');
-    if (!panel) return;
-    const show = typeof force === 'boolean' ? force : panel.hidden;
-    panel.hidden = !show;
-    if (btn) btn.setAttribute('aria-expanded', String(show));
-    if (show) updateTagDatalist();
+function toggleFilterOptions() {
+    // 内嵌栏里筛选分组列表始终可见，不需要额外的折叠按钮。
 }
 
-function toggleBatchTagOptions(force) {
-    const panel = document.querySelector('#ctm_batch_tag_options');
-    const btn = document.querySelector('#ctm_batch_tag_options_btn');
+function toggleBatchTagOptions() {
+    // 悬浮面板里输入标签的已添加标签列表始终可见，点击具体标签只会填入输入框。
+}
+
+function updateOptionsDirection(panel) {
     if (!panel) return;
-    const show = typeof force === 'boolean' ? force : panel.hidden;
-    panel.hidden = !show;
-    if (btn) btn.setAttribute('aria-expanded', String(show));
-    if (show) updateTagDatalist();
+    let openUp = false;
+    try {
+        const coarsePointer = window.matchMedia?.('(hover: none)').matches;
+        const touchDevice = navigator.maxTouchPoints > 0;
+        const parent = panel.parentElement;
+        const rect = parent?.getBoundingClientRect();
+        const belowSpace = rect ? window.innerHeight - rect.bottom : Number.POSITIVE_INFINITY;
+        openUp = coarsePointer || touchDevice || belowSpace < 240;
+    } catch {
+        openUp = true;
+    }
+    panel.classList.toggle('ctm-open-up', openUp);
 }
 
 function collectGroupedTags(records) {
@@ -759,7 +1010,6 @@ function renderFilterOptions(groups) {
         emptyText: s().filterOptionsEmpty,
         onPick: tag => {
             setFilter(tag);
-            toggleFilterOptions(false);
         },
     });
 }
@@ -767,14 +1017,16 @@ function renderFilterOptions(groups) {
 function renderBatchTagOptions(groups) {
     const list = document.querySelector('#ctm_batch_tag_options_list');
     if (!list) return;
+    const input = document.querySelector('#ctm_batch_tag');
+    const active = String(input?.value ?? '').trim();
     renderGroupedOptions(list, groups, {
-        active: '',
+        active,
         collapsedState: filterGroupCollapsed,
         emptyText: s().filterOptionsEmpty,
         onPick: tag => {
             const input = document.querySelector('#ctm_batch_tag');
             if (input) input.value = tag;
-            toggleBatchTagOptions(false);
+            updateTagDatalist();
         },
     });
 }
@@ -815,14 +1067,8 @@ function renderGroupedOptions(list, groups, { active = '', collapsedState, empty
         { key: 'preset', label: s().presetGroup, tags: grouped.preset ?? [] },
         { key: 'manual', label: s().manualGroup, tags: grouped.manual ?? [] },
     ];
-    const hasAutoGroups = (grouped.model?.length ?? 0) > 0 || (grouped.preset?.length ?? 0) > 0;
     for (const section of sections) {
         if (!section.tags.length) continue;
-        const isManualOnly = section.key === 'manual' && !hasAutoGroups;
-        if (isManualOnly) {
-            for (const tag of section.tags) list.append(makeOption(tag, section.label));
-            continue;
-        }
         const { group, items } = createGroupSection(section.key, section.label, section.tags.length, collapsedState ?? filterGroupCollapsed);
         for (const tag of section.tags) items.append(makeOption(tag, section.label));
         list.append(group);
@@ -861,6 +1107,8 @@ function startObserver() {
 }
 
 function stopObserver() {
+    tagHostObserver?.disconnect();
+    tagHostObserver = null;
     observer?.disconnect();
     observer = null;
     observedContainer = null;
@@ -1382,6 +1630,9 @@ export async function onActivate() {
 }
 
 export async function onDisable() {
+    window.removeEventListener('resize', positionTagPanel);
+    window.visualViewport?.removeEventListener('resize', positionTagPanel);
+    window.visualViewport?.removeEventListener('scroll', positionTagPanel);
     ++lifecycleEpoch;
     dataEpoch += 1;
     initialized = false;
@@ -1389,6 +1640,8 @@ export async function onDisable() {
     stopObserver();
     uninstallFetchWrapper();
     unbindEvents();
+    uninstallSelectModeGuard();
+    filterPanelOpen = false;
     document.querySelector('#ctm_settings')?.remove();
     await storeToClose?.drain();
     storeToClose?.close();
