@@ -427,16 +427,10 @@ function setFilter(query) {
     filterQuery = String(query ?? '').trim();
     const filterInput = document.querySelector('#ctm_filter');
     if (filterInput) filterInput.value = filterQuery;
-    if (filterQuery) {
-        // 从标签胶囊或下拉选项发起筛选时，自动展开筛选栏，让用户能看到当前筛选条件并能快速清除。
-        if (!filterPanelOpen) {
-            toggleFilterPanel(true, 'filter');
-        } else {
-            setPanelSection('filter');
-        }
-    }
+    // 筛选只更新聊天列表；悬浮窗由工具栏按钮显式打开。
     applyFilter();
     updateTagDatalist();
+    updateFilterPanel();
 }
 
 function applyFilter() {
@@ -739,9 +733,7 @@ function ensureToolbar() {
     filter.className = 'text_pole';
     filter.placeholder = s().filterPlaceholder;
     filter.addEventListener('input', () => {
-        filterQuery = filter.value.trim();
-        applyFilter();
-        updateTagDatalist();
+        setFilter(filter.value);
     });
 
     const filterControls = document.createElement('div');
@@ -779,10 +771,7 @@ function ensureToolbar() {
     clearFilter.title = s().clearFilter;
     clearFilter.addEventListener('click', event => {
         event.stopPropagation();
-        filter.value = '';
-        filterQuery = '';
-        applyFilter();
-        updateTagDatalist();
+        setFilter('');
     });
 
     filterView.append(filterControls, clearFilter);
