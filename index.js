@@ -15,16 +15,15 @@ import {
     recordMatchesTags,
     tagKindOf,
 } from './core.js';
-import { IndexedRecordStore } from './storage.js';
+import { ServerRecordStore } from './server-storage.js';
 
 const MODULE_NAME = 'chatTagManager';
 const AUTO_SCAN_CONCURRENCY = 3;
-const NATIVE_METADATA_KEY = 'chatTagManager';
 
 const strings = {
     zh: {
         title: '聊天标签管理',
-        description: '在“管理聊天文件”中给聊天打标签、筛选和批量管理。数据保存在浏览器 IndexedDB，不会修改聊天文件。',
+        description: '在“管理聊天文件”中给聊天打标签、筛选和批量管理。全部标签保存在酒馆服务器，同一账号可跨浏览器使用。',
         showTags: '在聊天卡片上显示标签',
         autoTag: '生成回复后自动打模型/预设标签',
         autoTagHelp: '开启后，每次 AI 回复完成会把当次模型和当前预设记为标签；关闭则只保留手动标签和“按聊天元数据补模型标签”。',
@@ -41,7 +40,7 @@ const strings = {
         clearScope: '清空当前角色卡的标签',
         clearScopeConfirm: '清空当前角色卡/群聊的全部标签？聊天文件不会被修改。',
         clearAll: '清空全部数据',
-        clearAllConfirm: '清空当前用户在本浏览器的全部标签数据？',
+        clearAllConfirm: '清空当前账号在服务器上的全部标签数据？',
         cleared: '已清空。',
         select: '选择模式',
         cancelSelect: '退出选择',
@@ -70,14 +69,14 @@ const strings = {
         tagRenamed: '标签已重命名。',
         tagRemoved: '标签已删除。',
         failed: '操作失败',
-        storageError: '无法打开本地 IndexedDB。',
+        storageError: '无法连接标签服务器，请安装服务端插件并重启酒馆。',
         renamePromptTitle: '重命名标签',
         renamePromptHelp: '输入新标签名：',
         deleteTagConfirm: '从当前角色卡/群聊的所有聊天中移除该标签？',
     },
     en: {
         title: 'Chat Tag Manager',
-        description: 'Tag, filter and batch-manage chats in Manage Chat Files. Data is stored in browser IndexedDB and chat files are never modified.',
+        description: 'Tag, filter and batch-manage chats in Manage Chat Files. All tags are stored on the SillyTavern server for use across browsers.',
         showTags: 'Show tags on chat cards',
         autoTag: 'Auto-tag models and presets after each reply',
         autoTagHelp: 'When enabled, each AI reply records its model and the current preset as tags. When disabled, only manual tags and "Tag chats with models from metadata" are used.',
@@ -123,7 +122,7 @@ const strings = {
         tagRenamed: 'Tag renamed.',
         tagRemoved: 'Tag removed.',
         failed: 'Operation failed',
-        storageError: 'Could not open local IndexedDB.',
+        storageError: 'Cannot connect to tag server. Install the server plugin and restart.',
         renamePromptTitle: 'Rename tag',
         renamePromptHelp: 'Enter the new tag name:',
         deleteTagConfirm: 'Remove this tag from all chats of the current character/group?',
@@ -177,56 +176,6 @@ function recordFor(scopeKey, fileName, create = false) {
     return recordStore.record(scopeKey, fileName, create);
 }
 
-/**
- * IndexedDB is the fast index, while the active chat's native metadata is the
- * durable backup. This keeps tags inside the chat JSONL file itself.
- */
-function nativeRecordForCurrentChat(scopeKey, fileName) {
-    const ctx = SillyTavern.getContext();
-    const currentFile = normalizeFileName(ctx?.chatId, { physical: true });
-    if (!currentFile || currentFile !== normalizeFileName(fileName, { physical: true })) return null;
-    if (currentScope().key !== scopeKey) return null;
-    const value = ctx?.chatMetadata?.[NATIVE_METADATA_KEY];
-    return value && typeof value === 'object' ? value : null;
-}
-
-async function persistNativeRecord(scopeKey, fileName, record) {
-    const ctx = SillyTavern.getContext();
-    const currentFile = normalizeFileName(ctx?.chatId, { physical: true });
-    if (!currentFile || currentFile !== normalizeFileName(fileName, { physical: true })) return;
-    if (currentScope().key !== scopeKey || !ctx?.chatMetadata) return;
-    ctx.chatMetadata[NATIVE_METADATA_KEY] = {
-        schemaVersion: 1,
-        tags: normalizeTags(record?.tags),
-        tagKinds: normalizeTagKinds(record?.tagKinds),
-        updatedAt: record?.updatedAt || new Date().toISOString(),
-    };
-    await ctx.saveMetadata?.();
-}
-
-async function restoreNativeRecord(scopeKey, fileName) {
-    const native = nativeRecordForCurrentChat(scopeKey, fileName);
-    if (!native) return false;
-    const local = recordFor(scopeKey, fileName);
-    const nativeTime = Date.parse(native.updatedAt || '') || 0;
-    const localTime = Date.parse(local?.updatedAt || '') || 0;
-    if (local && localTime >= nativeTime) return false;
-    const record = {
-        ...(local || {}),
-        tags: normalizeTags(native.tags),
-        tagKinds: normalizeTagKinds(native.tagKinds),
-        updatedAt: native.updatedAt || new Date().toISOString(),
-    };
-    await recordStore.put(scopeKey, fileName, record);
-    return true;
-}
-
-async function persistNativeEntries(scopeKey, entries) {
-    for (const [fileName, record] of entries) {
-        await persistNativeRecord(scopeKey, fileName, record);
-    }
-}
-
 function save() {
     context.saveSettingsDebounced();
 }
@@ -235,8 +184,8 @@ function log(...args) {
     console.log('[Chat Tag Manager]', ...args);
 }
 
-async function getUserHandle() {
-    const headers = context?.getRequestHeaders?.();
+async function getUserHandle(options = {}) {
+    const headers = options.headers ?? SillyTavern.getContext().getRequestHeaders();
     const response = await fetch('/api/users/me', { headers });
     if (!response.ok) throw new Error(`Unable to identify the current SillyTavern user (${response.status}).`);
     const handle = String((await response.json())?.handle ?? '').trim();
@@ -347,14 +296,8 @@ export function resolveChatRenameEvent(data) {
 }
 
 /** 聊天列表加载后，把本地记录里已经不存在的文件清理掉。 */
-async function reconcileScopeRecords(scopeKey, nativeResults, expectedEpoch = dataEpoch) {
-    if (expectedEpoch !== dataEpoch) return;
-    await recordStore.loadScope(scopeKey);
-    if (expectedEpoch !== dataEpoch) return;
-    const liveFiles = new Set(nativeResults.map(item => normalizeFileName(item.file_name ?? item.file_id)));
-    const staleFiles = Object.keys(recordStore.scope(scopeKey) ?? {}).filter(fileName => !liveFiles.has(fileName));
-    if (!staleFiles.length) return;
-    await Promise.all(staleFiles.map(fileName => recordStore.delete(scopeKey, fileName)));
+async function reconcileScopeRecords() {
+    // Search results are not proof of deletion. Never purge tags here.
 }
 
 export function installFetchWrapper() {
@@ -419,12 +362,6 @@ function renderVisibleCards() {
             if (initialized) renderVisibleCards();
         }).catch(error => console.warn('[Chat Tag Manager] IndexedDB scope load failed:', error));
         return;
-    }
-    const currentFile = normalizeFileName(SillyTavern.getContext()?.chatId, { physical: true });
-    if (currentFile) {
-        void restoreNativeRecord(scope.key, currentFile).then(restored => {
-            if (restored && initialized) renderVisibleCards();
-        }).catch(error => console.warn('[Chat Tag Manager] Native metadata restore failed:', error));
     }
     document.querySelectorAll('#select_chat_div .select_chat_block_wrapper').forEach(enhanceCard);
     ensureToolbar();
@@ -609,7 +546,6 @@ async function applyBatch(action) {
     }
     try {
         await recordStore.putMany(scope.key, entries);
-        await persistNativeEntries(scope.key, entries);
         log('applyBatch saved entries=', entries.length, 'scopeKeys=', Object.keys(recordStore.scope(scope.key)).length);
         if (input) input.value = '';
         renderVisibleCards();
@@ -1418,10 +1354,7 @@ async function runAutoModelScan() {
             if (done < fileNames.length) setStatus(s().autoModelProgress(fileNames.length, done));
         }
 
-        if (entries.length) {
-            await recordStore.putMany(scope.key, entries);
-            await persistNativeEntries(scope.key, entries);
-        }
+        if (entries.length) await recordStore.putMany(scope.key, entries);
         globalThis.toastr?.success(s().autoModelDone(scanned, changed, skipped));
         await refreshTagList();
         renderVisibleCards();
@@ -1484,7 +1417,6 @@ async function recordSourceTagsForCurrentChat() {
         record.tagKinds = kinds;
         record.updatedAt = new Date().toISOString();
         await recordStore.put(scope.key, fileName, record);
-        await persistNativeRecord(scope.key, fileName, record);
         refreshTagList();
         updateTagDatalist();
     } catch (error) {
@@ -1508,10 +1440,7 @@ async function renameTagInSettings(oldTag) {
             entries.push([fileName, record]);
         }
     }
-    if (entries.length) {
-        await recordStore.putMany(scope.key, entries);
-        await persistNativeEntries(scope.key, entries);
-    }
+    if (entries.length) await recordStore.putMany(scope.key, entries);
     globalThis.toastr?.success(s().tagRenamed);
     await refreshTagList();
     renderVisibleCards();
@@ -1532,10 +1461,7 @@ async function deleteTagInSettings(tag) {
             entries.push([fileName, record]);
         }
     }
-    if (entries.length) {
-        await recordStore.putMany(scope.key, entries);
-        await persistNativeEntries(scope.key, entries);
-    }
+    if (entries.length) await recordStore.putMany(scope.key, entries);
     globalThis.toastr?.success(s().tagRemoved);
     await refreshTagList();
     renderVisibleCards();
@@ -1629,18 +1555,6 @@ function bindEvents() {
         renderVisibleCards();
     });
 
-    bind(events.CHAT_LOADED, () => {
-        if (dataResetting) return;
-        refreshTagList();
-        renderVisibleCards();
-    });
-
-    bind(events.CHAT_CHANGED, () => {
-        if (dataResetting) return;
-        refreshTagList();
-        renderVisibleCards();
-    });
-
     bind(events.MESSAGE_RECEIVED, () => {
         if (dataResetting) return;
         void recordSourceTagsForCurrentChat();
@@ -1669,7 +1583,7 @@ export async function onActivate() {
     try {
         const handle = await getUserHandle({ headers: activationContext.getRequestHeaders() });
         if (!initialized || activationEpoch !== lifecycleEpoch) return;
-        activationStore = new IndexedRecordStore(handle);
+        activationStore = new ServerRecordStore(handle, () => activationContext.getRequestHeaders());
         await activationStore.open();
     } catch (error) {
         if (activationEpoch !== lifecycleEpoch) {
@@ -1720,22 +1634,7 @@ export async function onDisable() {
 export async function onClean() {
     context ??= SillyTavern.getContext();
     if (initialized) await onDisable();
-    let store = recordStore;
-    if (!store) {
-        try {
-            store = new IndexedRecordStore(await getUserHandle());
-        } catch (error) {
-            console.warn('[Chat Tag Manager] Could not identify the current user during cleanup:', error);
-        }
-    }
-    if (store) {
-        try {
-            await store.clearUser();
-        } catch (error) {
-            console.warn('[Chat Tag Manager] Could not clear records during cleanup:', error);
-        }
-        store.close();
-    }
+    // Uninstall keeps server tags intact.
     delete context.extensionSettings[MODULE_NAME];
     recordStore = null;
     document.querySelector('#ctm_settings')?.remove();
