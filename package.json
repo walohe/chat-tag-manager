@@ -1,0 +1,12 @@
+{
+  "name": "chat-tag-manager",
+  "version": "0.4.5.1",
+  "private": true,
+  "type": "module",
+  "main": "server-plugin-index.cjs",
+  "description": "SillyTavern chat tags frontend and server storage",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/walohe/chat-tag-manager.git"
+  }
+}

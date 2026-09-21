@@ -23,8 +23,60 @@
 
 **数据存储**
 
-标签保存在当前浏览器的 IndexedDB 中，按用户及角色／群聊分别管理，不修改聊天文件和消息内容。换浏览器或清理站点数据前，请留意标签数据不会随聊天文件自动迁移。
+所有标签（手动、预设、模型）保存在酒馆当前用户目录的 `chat-tag-manager.json`，上一份备份为 `chat-tag-manager.json.bak`。这些文件不在扩展仓库中，代码更新不会覆盖它们。同一服务器、同一账号可跨浏览器读取；不同服务器需要自行迁移用户数据。首次迁移请先使用有旧标签的浏览器打开：服务器尚未初始化时会导入该浏览器的 IndexedDB；初始化后不会再次自动合并其他浏览器的旧数据。
 
 **v0.4.4.1 更新**
 
 基于 v0.4.4 调整筛选交互：点击聊天卡片上的标签直接筛选，不再自动打开悬浮窗；漏斗按钮和悬浮窗内的筛选功能继续保留。
+
+## 安装与自动更新（v0.4.5.1）
+
+需要分别安装前端和服务端。两处使用同一个仓库的独立 Git 克隆。
+
+### 前端
+
+在酒馆「扩展 → 安装扩展」中输入：
+
+```text
+https://github.com/walohe/chat-tag-manager.git
+```
+
+manifest 已设置 `auto_update: true`。酒馆配置需允许扩展自动更新：
+
+```yaml
+extensions:
+  enabled: true
+  autoUpdate: true
+```
+
+请在现有配置下修改对应字段，不要重复添加整个配置节。更新后按酒馆提示刷新页面。
+
+### 服务端
+
+在酒馆根目录运行一次：
+
+```sh
+git clone https://github.com/walohe/chat-tag-manager.git plugins/chat-tag-manager-server
+```
+
+根目录的 `package.json` 将服务端入口指定为 `server-plugin-index.cjs`；此克隆虽包含前端文件，服务端只加载指定入口。无需额外 npm install，使用酒馆已有的 write-file-atomic 依赖。
+
+在 `config.yaml` 中确认：
+
+```yaml
+enableServerPlugins: true
+enableServerPluginsAutoUpdate: true
+```
+
+重启酒馆以加载插件。服务端插件随酒馆启动检查并拉取更新，运行中不会热替换。
+
+### 已通过 ZIP 或复制文件安装
+
+普通目录没有 Git 远端，单改 auto_update 无法更新。请先备份原目录与用户数据，将原目录移出插件扫描路径，再按上述方法重新安装。不要同时保留两个启用的前端副本或两个相同 ID 的服务端插件。尤其不要点击扩展中的“清空全部数据”来卸载。
+
+### 更新规则
+
+- 跟随各自 Git 克隆当前分支（通常为 main）的最新提交，不按 Releases 标签或 manifest 版本号选版本。
+- 前端更新不会顺便更新另一目录的服务端；两边都安装为 Git 克隆后，各自由酒馆原生机制更新。
+- 新版本同时更改两端时，先重启酒馆完成服务端更新，再刷新前端；未开启自动更新时分别手动 git pull。
+- 本地代码修改、网络错误或 Git 冲突可能阻止更新；不会强制重置本地文件。
