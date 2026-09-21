@@ -19,6 +19,7 @@ import { IndexedRecordStore } from './storage.js';
 
 const MODULE_NAME = 'chatTagManager';
 const AUTO_SCAN_CONCURRENCY = 3;
+const NATIVE_METADATA_KEY = 'chatTagManager';
 
 const strings = {
     zh: {
@@ -174,6 +175,56 @@ function currentScope() {
 
 function recordFor(scopeKey, fileName, create = false) {
     return recordStore.record(scopeKey, fileName, create);
+}
+
+/**
+ * IndexedDB is the fast index, while the active chat's native metadata is the
+ * durable backup. This keeps tags inside the chat JSONL file itself.
+ */
+function nativeRecordForCurrentChat(scopeKey, fileName) {
+    const ctx = SillyTavern.getContext();
+    const currentFile = normalizeFileName(ctx?.chatId, { physical: true });
+    if (!currentFile || currentFile !== normalizeFileName(fileName, { physical: true })) return null;
+    if (currentScope().key !== scopeKey) return null;
+    const value = ctx?.chatMetadata?.[NATIVE_METADATA_KEY];
+    return value && typeof value === 'object' ? value : null;
+}
+
+async function persistNativeRecord(scopeKey, fileName, record) {
+    const ctx = SillyTavern.getContext();
+    const currentFile = normalizeFileName(ctx?.chatId, { physical: true });
+    if (!currentFile || currentFile !== normalizeFileName(fileName, { physical: true })) return;
+    if (currentScope().key !== scopeKey || !ctx?.chatMetadata) return;
+    ctx.chatMetadata[NATIVE_METADATA_KEY] = {
+        schemaVersion: 1,
+        tags: normalizeTags(record?.tags),
+        tagKinds: normalizeTagKinds(record?.tagKinds),
+        updatedAt: record?.updatedAt || new Date().toISOString(),
+    };
+    await ctx.saveMetadata?.();
+}
+
+async function restoreNativeRecord(scopeKey, fileName) {
+    const native = nativeRecordForCurrentChat(scopeKey, fileName);
+    if (!native) return false;
+    const local = recordFor(scopeKey, fileName);
+    const nativeTime = Date.parse(native.updatedAt || '') || 0;
+    const localTime = Date.parse(local?.updatedAt || '') || 0;
+    if (local && localTime >= nativeTime) return false;
+    const record = {
+        ...(local || {}),
+        tags: normalizeTags(native.tags),
+        tagKinds: normalizeTagKinds(native.tagKinds),
+        updatedAt: native.updatedAt || new Date().toISOString(),
+    };
+    await recordStore.put(scopeKey, fileName, record);
+    return true;
+}
+
+async function persistNativeEntries(scopeKey, entries) {
+    for (const [fileName, record] of entries) {
+        await persistNativeRecord(scopeKey, fileName, record);
+    }
 }
 
 function save() {
@@ -369,6 +420,12 @@ function renderVisibleCards() {
         }).catch(error => console.warn('[Chat Tag Manager] IndexedDB scope load failed:', error));
         return;
     }
+    const currentFile = normalizeFileName(SillyTavern.getContext()?.chatId, { physical: true });
+    if (currentFile) {
+        void restoreNativeRecord(scope.key, currentFile).then(restored => {
+            if (restored && initialized) renderVisibleCards();
+        }).catch(error => console.warn('[Chat Tag Manager] Native metadata restore failed:', error));
+    }
     document.querySelectorAll('#select_chat_div .select_chat_block_wrapper').forEach(enhanceCard);
     ensureToolbar();
     applyFilter();
@@ -552,6 +609,7 @@ async function applyBatch(action) {
     }
     try {
         await recordStore.putMany(scope.key, entries);
+        await persistNativeEntries(scope.key, entries);
         log('applyBatch saved entries=', entries.length, 'scopeKeys=', Object.keys(recordStore.scope(scope.key)).length);
         if (input) input.value = '';
         renderVisibleCards();
@@ -1360,7 +1418,10 @@ async function runAutoModelScan() {
             if (done < fileNames.length) setStatus(s().autoModelProgress(fileNames.length, done));
         }
 
-        if (entries.length) await recordStore.putMany(scope.key, entries);
+        if (entries.length) {
+            await recordStore.putMany(scope.key, entries);
+            await persistNativeEntries(scope.key, entries);
+        }
         globalThis.toastr?.success(s().autoModelDone(scanned, changed, skipped));
         await refreshTagList();
         renderVisibleCards();
@@ -1423,6 +1484,7 @@ async function recordSourceTagsForCurrentChat() {
         record.tagKinds = kinds;
         record.updatedAt = new Date().toISOString();
         await recordStore.put(scope.key, fileName, record);
+        await persistNativeRecord(scope.key, fileName, record);
         refreshTagList();
         updateTagDatalist();
     } catch (error) {
@@ -1446,7 +1508,10 @@ async function renameTagInSettings(oldTag) {
             entries.push([fileName, record]);
         }
     }
-    if (entries.length) await recordStore.putMany(scope.key, entries);
+    if (entries.length) {
+        await recordStore.putMany(scope.key, entries);
+        await persistNativeEntries(scope.key, entries);
+    }
     globalThis.toastr?.success(s().tagRenamed);
     await refreshTagList();
     renderVisibleCards();
@@ -1467,7 +1532,10 @@ async function deleteTagInSettings(tag) {
             entries.push([fileName, record]);
         }
     }
-    if (entries.length) await recordStore.putMany(scope.key, entries);
+    if (entries.length) {
+        await recordStore.putMany(scope.key, entries);
+        await persistNativeEntries(scope.key, entries);
+    }
     globalThis.toastr?.success(s().tagRemoved);
     await refreshTagList();
     renderVisibleCards();
@@ -1556,6 +1624,18 @@ function bindEvents() {
     });
 
     bind(events.CHARACTER_LOADED, () => {
+        if (dataResetting) return;
+        refreshTagList();
+        renderVisibleCards();
+    });
+
+    bind(events.CHAT_LOADED, () => {
+        if (dataResetting) return;
+        refreshTagList();
+        renderVisibleCards();
+    });
+
+    bind(events.CHAT_CHANGED, () => {
         if (dataResetting) return;
         refreshTagList();
         renderVisibleCards();
